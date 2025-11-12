@@ -1,0 +1,43 @@
+name: Zillow Monthly Emailer
+
+on:
+  # Run every day at 09:00 PT / 10:00 PDT (17:00 UTC) so we catch mid-month releases
+  schedule:
+    - cron: '0 17 * * *'
+  workflow_dispatch: {}  # allow manual runs
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zillow-monthly-mailer
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # System deps for rtree (used by GeoPandas/labels)
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libspatialindex-dev
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run script
+        env:
+          GMAIL_APP_PWD: ${{ secrets.GMAIL_APP_PWD }}
+        run: |
+          python zillow_monthly_emailer.py
