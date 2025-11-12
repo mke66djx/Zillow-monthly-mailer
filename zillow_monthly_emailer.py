@@ -18,7 +18,7 @@ Notes:
 """
 
 import io, re, ssl, smtplib, pathlib, warnings, requests, pandas as pd, matplotlib.pyplot as plt
-from datetime import datetime
+from datetime import datetime, timezone
 from bs4 import BeautifulSoup
 from dateutil.parser import parse as parse_date
 from email.mime.multipart import MIMEMultipart
@@ -43,21 +43,20 @@ SMTP_MODE = "starttls"  # "ssl" or "starttls"
 
 # Investment metric knobs
 OPEX_RATE = 0.30  # share of gross rent treated as operating expenses
-DPCT = 0.20  # down payment percent (20% matches Zillow payment series)
-CLOSING_COST_RATE = 0.03  # assumed buyer cash closing costs (for CoC denominator)
-HOLD_MONTHS = 6  # holding period for flip metrics
+DPCT = 0.20       # down payment percent (20% matches Zillow payment series)
+CLOSING_COST_RATE = 0.03
+HOLD_MONTHS = 6
 
 # Summary table horizon for county/metro overlays
 SUMMARY_LAST_N_MONTHS = 12
 
 # ----- ZIP chart/table controls -----
-ZIP_TOP_UP = 5      # number of highest YoY movers to plot
-ZIP_TOP_DOWN = 2    # number of lowest YoY movers to plot
-ZIP_MA_MONTHS = 3   # moving average for smoother lines (0 = off)
-ZIP_RANK_MIN_MONTHS = 6  # minimum months required to rank a ZIP
+ZIP_TOP_UP = 5
+ZIP_TOP_DOWN = 2
+ZIP_MA_MONTHS = 3
+ZIP_RANK_MIN_MONTHS = 6
 
-# ----------------- AREAS: exactly one County + one Metro per area -----------------
-# IMPORTANT: Use the Metro CSV's RegionName values (e.g., "Chicago, IL")
+# ----------------- AREAS -----------------
 AREAS = [
     {"name": "Sacramento", "county": "Sacramento County, CA", "metro": "Sacramento, CA"},
     {"name": "San Francisco", "county": "San Francisco County, CA", "metro": "San Francisco, CA"},
@@ -86,7 +85,6 @@ FILENAME_PATTERNS = {
         "County": r"County_zori_.*_sm_month\.csv",
         "Zip": r"Zip_zori_.*_sm_month\.csv",
     },
-    # NEW: Zillow 20% down total monthly payment (Metro only)
     "payment": {
         "Metro": r"Metro_total_monthly_payment_downpayment_0\.20_.*_sm_sa_month\.csv",
     },
@@ -100,13 +98,11 @@ FALLBACK_FILES = {
     ("zori", "Metro"): "Metro_zori_uc_sfrcondomfr_sm_month.csv",
     ("zori", "County"): "County_zori_uc_sfrcondomfr_sm_month.csv",
     ("zori", "Zip"): "Zip_zori_uc_sfrcondomfr_sm_month.csv",
-    # NEW: fallback for total monthly payment (20% down)
     ("payment", "Metro"): "Metro_total_monthly_payment_downpayment_0.20_uc_sfrcondo_tier_0.33_0.67_sm_sa_month.csv",
 }
 
 # ==================== Core helpers ====================
 def _latest_available_month_for_guard() -> str | None:
-    # After prefetch_all(), this uses ZHVI Zip (which always updates) to find the newest month
     df = PREFETCH.get(("zhvi", "Zip"))
     if df is None or df.empty or "date" not in df.columns:
         return None
@@ -118,52 +114,77 @@ def _already_sent(asof: str, stamp_path: str) -> bool:
         return False
     try:
         with open(stamp_path, "r") as f:
-            return (json.load(f).get("last_sent") == asof)
+            data = json.load(f)
+        # backward compat: old stamp had only {"last_sent": "..."}
+        last_sent = data.get("last_sent")
+        return (last_sent == asof)
     except Exception:
         return False
 
-def _write_sent(asof: str, stamp_path: str):
+def _write_sent_extended(asof: str, stamp_path: str, meta: dict):
     pathlib.Path(stamp_path).parent.mkdir(parents=True, exist_ok=True)
+    payload = {"last_sent": asof, **meta}
     with open(stamp_path, "w") as f:
-        json.dump({"last_sent": asof}, f)
+        json.dump(payload, f, indent=2, default=str)
+
+def _read_stamp(stamp_path: str) -> dict:
+    if not os.path.exists(stamp_path):
+        return {}
+    try:
+        with open(stamp_path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
 def find_csv_url(dataset: str, geolevel: str) -> str:
-    # Zillow uses a different subfolder for the "payment" dataset
     subfolder = "total_monthly_payment" if dataset == "payment" else dataset
     fallback = f"{BASE_PREFIX}/{subfolder}/{FALLBACK_FILES[(dataset, geolevel)]}"
-
     try:
         resp = requests.get(ZILLOW_DATA_PAGE, headers=HEADERS, timeout=30)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
-
         anchors = soup.find_all("a", href=True)
         hrefs = [a["href"].split("?")[0] for a in anchors
                  if "files.zillowstatic.com/research/public_csvs" in a["href"]]
-
         regex = re.compile(FILENAME_PATTERNS[dataset][geolevel], re.IGNORECASE)
         needle = f"/{subfolder}/"
         for href in hrefs:
             if needle in href and regex.search(href):
                 return href
-
         return fallback
     except Exception as e:
         print(f"[WARN] Could not scrape Zillow page ({e}). Using fallback URL.")
         return fallback
+
+def _head_meta(url: str) -> dict:
+    """Fast HEAD to capture Last-Modified and ETag (if provided)."""
+    try:
+        r = requests.head(url, headers=HEADERS, timeout=30, allow_redirects=True)
+        lm = r.headers.get("Last-Modified")
+        et = r.headers.get("ETag")
+        # normalize Last-Modified to ISO
+        lm_iso = None
+        if lm:
+            try:
+                dt = parse_date(lm)
+                if not dt.tzinfo:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                lm_iso = dt.astimezone(timezone.utc).isoformat()
+            except Exception:
+                lm_iso = lm
+        return {"last_modified": lm_iso, "etag": et}
+    except Exception as e:
+        return {"last_modified": None, "etag": None, "error": str(e)}
 
 def load_wide_csv(url: str) -> pd.DataFrame:
     r = requests.get(url, headers=HEADERS, timeout=120)
     if r.status_code == 403:
         print("[WARN] 403 on file download; retrying once…")
         r = requests.get(url, headers=HEADERS, timeout=120)
-
-    # Auto-fix if a stale /payment/ URL 404s — swap to /total_monthly_payment/ and retry once
     if r.status_code == 404 and "/research/public_csvs/payment/" in url:
         fixed_url = url.replace("/research/public_csvs/payment/", "/research/public_csvs/total_monthly_payment/")
         print(f"[WARN] 404 on payment URL; retrying with folder fix → {fixed_url}")
         r = requests.get(fixed_url, headers=HEADERS, timeout=120)
-
     r.raise_for_status()
     content = r.content
     if b"," not in content and b"\n" not in content:
@@ -183,7 +204,6 @@ def to_long(df: pd.DataFrame) -> pd.DataFrame:
         except Exception:
             pass
         meta_cols.add(c)
-
     time_cols = [c for c in time_cols if c in df.columns]
     id_vars = [c for c in df.columns if c not in time_cols]
     long = df.melt(id_vars=id_vars, value_vars=time_cols, var_name="date_str", value_name="value")
@@ -281,8 +301,8 @@ def smart_match_one(df_long: pd.DataFrame, target: str, geolevel_hint: str | Non
         ]
         if "Metro" in df_long.columns:
             parts.append(
-                metro.str_contains(re.escape(tn), na=False) if hasattr(metro, "str_contains") else metro.str.contains(
-                    re.escape(tn), na=False))
+                metro.str.contains(re.escape(tn), na=False)
+            )
         mask = parts[0]
         for p in parts[1:]: mask |= p
         mask &= state_ok
@@ -482,7 +502,6 @@ def fmt_home_value(v: float) -> str:
 def fmt_rent_exact(v: float) -> str:
     return f"${v:,.0f}"
 
-# helper to avoid backslash-in-f-string issues
 def slugify_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9\-]+", "_", str(name))
 
@@ -795,133 +814,6 @@ def build_metro_investment_tables(areas: list[dict], out_dir: pathlib.Path) -> t
 
     return rental_path if not rental_df.empty else "", flip_path if not flip_df.empty else ""
 
-# =============================== Main ===============================
-def main():
-    warnings.filterwarnings("ignore")
-    out_dir = pathlib.Path(OUT_DIR)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Prefetch Metro + County + Zip for ZHVI/ZORI + Metro for PAYMENT
-    prefetch_all()
-
-    # ---- RUN-ONCE-PER-NEW-MONTH GUARD (after data is loaded) ----
-    stamp = str(pathlib.Path(OUT_DIR) / "_last_sent.json")
-    asof = _latest_available_month_for_guard()
-    if not asof:
-        print("[INFO] No latest month detected yet; exiting.")
-        return
-    if _already_sent(asof, stamp):
-        print(f"[INFO] Already sent for {asof}; exiting.")
-        return
-
-    charts = []
-    csv_paths = []
-    series_catalog = {"zhvi": {}, "zori": {}}
-    html_sections = []  # ONLY the two summary tables go in the body
-
-    for dataset in ("zhvi", "zori"):
-        ylabel = "Typical Home Value ($)" if dataset == "zhvi" else "Typical Rent ($)"
-        fmt_fn = fmt_home_value if dataset == "zhvi" else fmt_rent_exact
-
-        for area in AREAS:
-            # 1) County vs Metro overlay
-            s_county = series_for(dataset, "County", area["county"])
-            s_metro  = series_for(dataset, "Metro",  area["metro"])
-
-            layers, labels = [], []
-            if not s_county.empty:
-                layers.append(s_county); labels.append(f"{area['county']} (County)")
-                series_catalog[dataset][f"{area['name']} — County"] = s_county
-            if not s_metro.empty:
-                layers.append(s_metro); labels.append(f"{area['metro']} (Metro)")
-                series_catalog[dataset][f"{area['name']} — Metro"] = s_metro
-
-            if len(layers) < 2:
-                print(f"[WARN] Missing one layer for {area['name']} ({dataset}). Have: {', '.join(labels) if labels else 'none'}")
-
-            if layers:
-                safe_name = re.sub(r"[^A-Za-z0-9\-]+", "_", f"overlay_{dataset}_{area['name']}_County_vs_Metro")
-                out_path = str(out_dir / f"{safe_name}.png")
-                title = f"{area['name']} — County vs Metro ({dataset.upper()})"
-                plot_overlay_chart(layers, labels, title, ylabel, out_path, annotate_index=0, fmt_fn=fmt_fn)
-                charts.append((title, out_path))
-
-            # 2) ZIP: series + metrics + ranked plots + 12-month backup table (CSV attachments only)
-            zip_map = zip_series_by_metro(dataset, area["metro"])
-            if not zip_map:
-                print(f"[WARN] No ZIP series found for {area['metro']} ({dataset}).")
-                continue
-
-            zdf = zip_metrics(zip_map)
-            if zdf.empty:
-                print(f"[WARN] No ZIP metrics computed for {area['metro']} ({dataset}).")
-                continue
-
-            zdf_ok = zdf[zdf["n"] >= ZIP_RANK_MIN_MONTHS].copy()
-            if zdf_ok.empty:
-                print(f"[WARN] Not enough ZIP history for ranking in {area['metro']} ({dataset}).")
-            yoy_map = dict(zip(zdf_ok["zip"], zdf_ok["yoy_pct"]))
-
-            top_up   = zdf_ok.sort_values("yoy_pct", ascending=False).head(ZIP_TOP_UP)["zip"].tolist()
-            top_down = zdf_ok.sort_values("yoy_pct", ascending=True ).head(ZIP_TOP_DOWN)["zip"].tolist()
-
-            if top_up:
-                safe_up = re.sub(r"[^A-Za-z0-9\-]+", "_", f"zipTopUp_{dataset}_{area['name']}")
-                out_up = str(out_dir / f"{safe_up}.png")
-                title_up = f"{area['name']} — ZIPs Top {ZIP_TOP_UP} YoY ↑ ({dataset.upper()})"
-                plot_ranked_zips(zip_map, title_up, ylabel, out_up, pick_zips=top_up, yoy_map=yoy_map,
-                                 ma_months=ZIP_MA_MONTHS)
-                charts.append((title_up, out_up))
-            if top_down:
-                safe_dn = re.sub(r"[^A-Za-z0-9\-]+", "_", f"zipTopDown_{dataset}_{area['name']}")
-                out_dn = str(out_dir / f"{safe_dn}.png")
-                title_dn = f"{area['name']} — ZIPs Bottom {ZIP_TOP_DOWN} YoY ↓ ({dataset.upper()})"
-                plot_ranked_zips(zip_map, title_dn, ylabel, out_dn, pick_zips=top_down, yoy_map=yoy_map,
-                                 ma_months=ZIP_MA_MONTHS)
-                charts.append((title_dn, out_dn))
-
-            # 12-month ZIP backup table (ALL ZIPs) — CSV attachment only
-            raw12, _fmt12 = build_zip_last12_table(zip_map)
-            if not raw12.empty:
-                safe_area = slugify_name(area['name'])
-                zcsv = out_dir / f"zip_last12_{dataset}_{safe_area}.csv"
-                raw12.to_csv(zcsv)
-                csv_paths.append(str(zcsv))
-
-            # Also attach the metrics table
-            safe_area = slugify_name(area['name'])
-            zmet_csv = out_dir / f"zip_metrics_{dataset}_{safe_area}.csv"
-            zdf.sort_values("yoy_pct", ascending=False).to_csv(zmet_csv, index=False)
-            csv_paths.append(str(zmet_csv))
-
-    # -------- Build summary tables for County/Metro (ZHVI and ZORI) — the ONLY tables shown in body --------
-    for ds_key, ds_title in [
-        ("zhvi", "Summary – ZHVI (Last 12 Months)"),
-        ("zori", "Summary – ZORI (Last 12 Months)")
-    ]:
-        raw, fmt = build_summary_for_dataset(series_catalog.get(ds_key, {}), SUMMARY_LAST_N_MONTHS)
-        if not raw.empty:
-            csv_path = pathlib.Path(OUT_DIR) / f"summary_{ds_key}_last12.csv"
-            save_csv(raw, csv_path)
-            csv_paths.append(str(csv_path))
-            html_sections.append(table_to_html(fmt, ds_title))  # only summaries go in email body
-
-    # -------- NEW: Build & attach investment metrics (Metro) --------
-    rental_csv, flip_csv = build_metro_investment_tables(AREAS, out_dir)
-    if rental_csv: csv_paths.append(rental_csv)
-    if flip_csv:   csv_paths.append(flip_csv)
-
-    # -------- ZIP Choropleth Heatmaps (ZHVI & ZORI YoY) --------
-    build_and_attach_zip_heatmaps(AREAS, out_dir, charts)
-
-    # Email all results
-    if charts or html_sections:
-        email_charts_and_tables(charts, html_sections, csv_paths)
-        # ✅ Mark this month as sent (so it doesn’t send again)
-        _write_sent(asof, stamp)
-    else:
-        print("[WARN] No charts or tables generated.")
-
 # =============================== ZIP Choropleth Heatmaps (NEW) ===============================
 def _ensure_packages_for_maps():
     try:
@@ -989,7 +881,6 @@ def _compute_yoy_from_wide(df_wide: pd.DataFrame) -> pd.DataFrame:
     return out
 
 def _load_zip_wide(dataset_key: str) -> pd.DataFrame:
-    # Download the live ZIP-wide CSV directly; fallback to known-good filename if needed
     url = find_csv_url(dataset_key, "Zip")
     try:
         return load_wide_csv(url)
@@ -1035,7 +926,6 @@ def _build_heatmap_for_area(area: dict, zhvi_zip: pd.DataFrame, zori_zip: pd.Dat
         if "CountyName" in df.columns: df["CountyName"] = df["CountyName"].astype(str)
         if "State" in df.columns: df["State"] = df["State"].astype(str)
 
-    # Restrict to county (by CountyName + State)
     county_token = county_name.split()[0]
     zhvi_c = zhvi_yoy[
         (zhvi_yoy.get("CountyName", "").str.contains(county_token, case=False, na=False)) &
@@ -1046,7 +936,6 @@ def _build_heatmap_for_area(area: dict, zhvi_zip: pd.DataFrame, zori_zip: pd.Dat
         (zori_yoy.get("State", "") == state_abbr)
     ]
 
-    # ZCTA boundaries in web mercator
     gdf_zip = gdf_zcta.to_crs(epsg=3857).copy()
     gdf_zip["zip"] = gdf_zip["ZCTA5CE20"].astype(str)
     gdf_zip = gdf_zip[gdf_zip.geometry.intersects(county_poly.buffer(0))]
@@ -1055,6 +944,7 @@ def _build_heatmap_for_area(area: dict, zhvi_zip: pd.DataFrame, zori_zip: pd.Dat
     def _plot(gdf_zip, gdf_c, area, out_dir, layer_df, metric_name: str, cmap="Reds"):
         from matplotlib.colors import Normalize
         from adjustText import adjust_text
+        import numpy as np
 
         g = gdf_zip.merge(layer_df[["zip", "yoy_pct"]], on="zip", how="left")
         if g["yoy_pct"].notna().sum() == 0:
@@ -1072,8 +962,8 @@ def _build_heatmap_for_area(area: dict, zhvi_zip: pd.DataFrame, zori_zip: pd.Dat
             try:
                 valf = float(val)
             except Exception:
-                valf = np.nan
-            if np.isfinite(valf) and valf > 0:
+                valf = float("nan")
+            if (valf == valf) and (valf > 0):
                 facecolors.append(plt.cm.Reds(norm(valf)))
             else:
                 facecolors.append("#f0f0f0")
@@ -1099,10 +989,9 @@ def _build_heatmap_for_area(area: dict, zhvi_zip: pd.DataFrame, zori_zip: pd.Dat
         N = 30
         min_area = 1.5e6
         min_abs_yoy = 0.5
-
         g_rank = g.copy()
         g_rank["abs_yoy"] = g_rank["yoy_pct"].abs()
-        g_rank = g_rank[np.isfinite(g_rank["abs_yoy"])]
+        g_rank = g_rank[(g_rank["abs_yoy"] == g_rank["abs_yoy"])]
         g_rank = g_rank[g_rank.geometry.area >= min_area]
         g_rank = g_rank[g_rank["abs_yoy"] >= min_abs_yoy]
         g_rank = g_rank.sort_values("abs_yoy", ascending=False).head(N).copy()
@@ -1153,6 +1042,222 @@ def build_and_attach_zip_heatmaps(areas, out_dir: pathlib.Path, charts_list: lis
             charts_list.extend(hm)
     except Exception as e:
         print(f"[WARN] Heatmap generation failed: {e}")
+
+# =========================== SMART RELEASE GUARD (NEW) ===========================
+def _latest_month_in_wide(df_wide: pd.DataFrame) -> str | None:
+    if df_wide is None or df_wide.empty:
+        return None
+    date_cols = [c for c in df_wide.columns if re.fullmatch(r"\d{4}-\d{2}", str(c))]
+    if not date_cols:
+        # try YYYY-MM-DD
+        date_cols = [c for c in df_wide.columns if re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(c))]
+        if not date_cols:
+            return None
+    latest = sorted(date_cols)[-1]
+    try:
+        dt = parse_date(latest)
+        return f"{dt.year:04d}-{dt.month:02d}"
+    except Exception:
+        return latest[:7] if len(latest) >= 7 else None
+
+def _light_fetch_latest_months_and_headers() -> dict:
+    """Fetch URLs and HEAD meta for three key files, and read just enough to determine latest month."""
+    keys = [
+        ("zhvi", "Zip"),
+        ("zori", "Zip"),
+        ("payment", "Metro"),
+    ]
+    info = {}
+    for ds, lvl in keys:
+        url = find_csv_url(ds, lvl)
+        meta = _head_meta(url)
+        try:
+            # small GET to detect latest month (we still need columns)
+            wide = load_wide_csv(url)
+            latest = _latest_month_in_wide(wide)
+        except Exception as e:
+            latest = None
+            meta["error_get"] = str(e)
+        info[f"{ds}_{lvl.lower()}"] = {"url": url, "latest_month": latest, **meta}
+    return info
+
+def _is_new_release(stamp: dict, probe: dict) -> tuple[bool, str]:
+    """
+    Decide if we should run:
+      - TRUE if latest month advanced for any key series
+      - OR Last-Modified/ETag changed relative to stamp (silent data refresh)
+    """
+    # last time we sent
+    last_sent = (stamp or {}).get("last_sent")
+
+    # if FORCE_SEND, always run
+    if os.getenv("FORCE_SEND", "").strip() == "1":
+        return True, "FORCE_SEND=1"
+
+    reasons = []
+    advanced = False
+    changed_headers = False
+
+    for k, cur in probe.items():
+        latest = (cur or {}).get("latest_month")
+        if latest and last_sent and latest > last_sent:
+            advanced = True
+            reasons.append(f"{k} month advanced to {latest}")
+
+        # compare headers
+        prev_k = ((stamp or {}).get("head_meta") or {}).get(k, {})
+        if prev_k:
+            if (prev_k.get("last_modified") != cur.get("last_modified")) or (prev_k.get("etag") != cur.get("etag")):
+                changed_headers = True
+                reasons.append(f"{k} headers changed (LM/ETag)")
+        else:
+            # no previous meta; treat first run as new
+            changed_headers = True
+            reasons.append(f"{k} first-run or missing prior meta")
+
+    if advanced or changed_headers:
+        return True, "; ".join(reasons) if reasons else "new release detected"
+    return False, "no new month and headers unchanged"
+
+# =============================== Main ===============================
+def main():
+    warnings.filterwarnings("ignore")
+    out_dir = pathlib.Path(OUT_DIR)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---- SMART RELEASE PROBE (fast) ----
+    stamp_path = str(pathlib.Path(OUT_DIR) / "_last_sent.json")
+    prev = _read_stamp(stamp_path)
+    probe = _light_fetch_latest_months_and_headers()
+    should_run, reason = _is_new_release(prev, probe)
+
+    if not should_run:
+        print(f"[INFO] No new Zillow data detected — {reason}. Exiting.")
+        return
+    else:
+        print(f"[INFO] Proceeding — {reason}")
+
+    # Prefetch full long-format frames for processing
+    prefetch_all()
+
+    # ---- RUN-ONCE-PER-NEW-MONTH GUARD (based on data actually loaded) ----
+    # Use ZHVI Zip long for a definitive as-of month
+    asof = _latest_available_month_for_guard()
+    if not asof:
+        print("[INFO] No latest month detected yet; exiting.")
+        return
+
+    # Proceed to generate all outputs
+    charts = []
+    csv_paths = []
+    series_catalog = {"zhvi": {}, "zori": {}}
+    html_sections = []
+
+    for dataset in ("zhvi", "zori"):
+        ylabel = "Typical Home Value ($)" if dataset == "zhvi" else "Typical Rent ($)"
+        fmt_fn = fmt_home_value if dataset == "zhvi" else fmt_rent_exact
+
+        for area in AREAS:
+            # 1) County vs Metro overlay
+            s_county = series_for(dataset, "County", area["county"])
+            s_metro  = series_for(dataset, "Metro",  area["metro"])
+
+            layers, labels = [], []
+            if not s_county.empty:
+                layers.append(s_county); labels.append(f"{area['county']} (County)")
+                series_catalog[dataset][f"{area['name']} — County"] = s_county
+            if not s_metro.empty:
+                layers.append(s_metro); labels.append(f"{area['metro']} (Metro)")
+                series_catalog[dataset][f"{area['name']} — Metro"] = s_metro
+
+            if len(layers) < 2:
+                have = ', '.join(labels) if labels else 'none'
+                print(f"[WARN] Missing one layer for {area['name']} ({dataset}). Have: {have}")
+
+            if layers:
+                safe_name = re.sub(r"[^A-Za-z0-9\-]+", "_", f"overlay_{dataset}_{area['name']}_County_vs_Metro")
+                out_path = str(out_dir / f"{safe_name}.png")
+                title = f"{area['name']} — County vs Metro ({dataset.upper()})"
+                plot_overlay_chart(layers, labels, title, ylabel, out_path, annotate_index=0, fmt_fn=fmt_fn)
+                charts.append((title, out_path))
+
+            # 2) ZIP plots + metrics + last-12 CSVs
+            zip_map = zip_series_by_metro(dataset, area["metro"])
+            if not zip_map:
+                print(f"[WARN] No ZIP series found for {area['metro']} ({dataset}).")
+                continue
+
+            zdf = zip_metrics(zip_map)
+            if zdf.empty:
+                print(f"[WARN] No ZIP metrics computed for {area['metro']} ({dataset}).")
+                continue
+
+            zdf_ok = zdf[zdf["n"] >= ZIP_RANK_MIN_MONTHS].copy()
+            if zdf_ok.empty:
+                print(f"[WARN] Not enough ZIP history for ranking in {area['metro']} ({dataset}).")
+            yoy_map = dict(zip(zdf_ok["zip"], zdf_ok["yoy_pct"]))
+
+            top_up   = zdf_ok.sort_values("yoy_pct", ascending=False).head(ZIP_TOP_UP)["zip"].tolist()
+            top_down = zdf_ok.sort_values("yoy_pct", ascending=True ).head(ZIP_TOP_DOWN)["zip"].tolist()
+
+            if top_up:
+                safe_up = re.sub(r"[^A-Za-z0-9\-]+", "_", f"zipTopUp_{dataset}_{area['name']}")
+                out_up = str(out_dir / f"{safe_up}.png")
+                title_up = f"{area['name']} — ZIPs Top {ZIP_TOP_UP} YoY ↑ ({dataset.upper()})"
+                plot_ranked_zips(zip_map, title_up, ylabel, out_up, pick_zips=top_up, yoy_map=yoy_map,
+                                 ma_months=ZIP_MA_MONTHS)
+                charts.append((title_up, out_up))
+            if top_down:
+                safe_dn = re.sub(r"[^A-Za-z0-9\-]+", "_", f"zipTopDown_{dataset}_{area['name']}")
+                out_dn = str(out_dir / f"{safe_dn}.png")
+                title_dn = f"{area['name']} — ZIPs Bottom {ZIP_TOP_DOWN} YoY ↓ ({dataset.upper()})"
+                plot_ranked_zips(zip_map, title_dn, ylabel, out_dn, pick_zips=top_down, yoy_map=yoy_map,
+                                 ma_months=ZIP_MA_MONTHS)
+                charts.append((title_dn, out_dn))
+
+            # 12-month ZIP backup table (CSV attachment only)
+            raw12, _fmt12 = build_zip_last12_table(zip_map)
+            if not raw12.empty:
+                safe_area = slugify_name(area['name'])
+                zcsv = out_dir / f"zip_last12_{dataset}_{safe_area}.csv"
+                raw12.to_csv(zcsv)
+                csv_paths.append(str(zcsv))
+
+            # metrics CSV attachment
+            safe_area = slugify_name(area['name'])
+            zmet_csv = out_dir / f"zip_metrics_{dataset}_{safe_area}.csv"
+            zdf.sort_values("yoy_pct", ascending=False).to_csv(zmet_csv, index=False)
+            csv_paths.append(str(zmet_csv))
+
+    # -------- Summary tables (shown in body) --------
+    for ds_key, ds_title in [
+        ("zhvi", "Summary – ZHVI (Last 12 Months)"),
+        ("zori", "Summary – ZORI (Last 12 Months)")
+    ]:
+        raw, fmt = build_summary_for_dataset(series_catalog.get(ds_key, {}), SUMMARY_LAST_N_MONTHS)
+        if not raw.empty:
+            csv_path = pathlib.Path(OUT_DIR) / f"summary_{ds_key}_last12.csv"
+            save_csv(raw, csv_path)
+            csv_paths.append(str(csv_path))
+            html_sections.append(table_to_html(fmt, ds_title))
+
+    # -------- Investment metrics (Metro) --------
+    rental_csv, flip_csv = build_metro_investment_tables(AREAS, out_dir)
+    if rental_csv: csv_paths.append(rental_csv)
+    if flip_csv:   csv_paths.append(flip_csv)
+
+    # -------- ZIP Choropleth Heatmaps --------
+    build_and_attach_zip_heatmaps(AREAS, out_dir, charts)
+
+    # Email all results, then record extended stamp
+    if charts or html_sections:
+        email_charts_and_tables(charts, html_sections, csv_paths)
+        stamp_meta = {
+            "head_meta": probe,  # store url + last-modified + etag + latest_month seen per key file
+        }
+        _write_sent_extended(asof, stamp_path, stamp_meta)
+    else:
+        print("[WARN] No charts or tables generated.")
 
 if __name__ == "__main__":
     main()
