@@ -1,18 +1,18 @@
 name: Zillow Monthly Emailer
 
 on:
-  # Run every day at 09:00 PST / 10:00 PDT (17:00 UTC) to catch mid-month releases
+  # Run every day at 09:00 PST / 10:00 PDT (17:00 UTC)
   schedule:
     - cron: '0 17 * * *'
   workflow_dispatch:
     inputs:
       force_send:
-        description: 'Bypass release guard and send regardless of new data'
+        description: 'Bypass guard and send regardless (FORCE_SEND=1)'
         type: boolean
         default: false
 
 permissions:
-  contents: read
+  contents: write   # needed to commit state/_last_sent.json after a send
 
 concurrency:
   group: zillow-monthly-mailer
@@ -41,7 +41,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # If manual run with force_send=true, set FORCE_SEND=1 for this job
+      # If manual run with force_send=true, set FORCE_SEND=1
       - name: Set FORCE_SEND if requested
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.force_send == true }}
         run: echo "FORCE_SEND=1" >> "$GITHUB_ENV"
@@ -49,6 +49,13 @@ jobs:
       - name: Run Zillow Monthly Emailer
         env:
           GMAIL_APP_PWD: ${{ secrets.GMAIL_APP_PWD }}
-          # FORCE_SEND comes from $GITHUB_ENV if you toggled it above
         run: |
           python zillow_monthly_emailer.py
+
+      # Persist the updated month to the repo so future runs can skip correctly
+      - name: Commit updated stamp (if changed)
+        if: always()
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: update zillow last-sent stamp"
+          file_pattern: state/_last_sent.json
