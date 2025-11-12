@@ -1,0 +1,24 @@
+# --- Core ---
+pandas==2.2.2
+matplotlib==3.9.0
+requests==2.32.3
+beautifulsoup4==4.12.3
+python-dateutil==2.9.0.post0
+lxml==5.2.1
+
+# --- Data and numeric ---
+numpy==1.26.4
+
+# --- Email & MIME (standard library covers it, but added for completeness) ---
+email-validator==2.2.0
+
+# --- Mapping / geospatial for ZIP heatmaps ---
+geopandas==0.14.3
+shapely==2.0.3
+pyproj==3.6.1
+rtree==1.2.0
+contextily==1.5.0
+adjustText==1.1.1
+
+# --- System utility (used by geopandas & shapely on GH Actions) ---
+fiona==1.9.6
