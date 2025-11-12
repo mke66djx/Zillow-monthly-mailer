@@ -482,6 +482,10 @@ def fmt_home_value(v: float) -> str:
 def fmt_rent_exact(v: float) -> str:
     return f"${v:,.0f}"
 
+# helper to avoid backslash-in-f-string issues
+def slugify_name(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9\-]+", "_", str(name))
+
 # ========================= Overlay plotting =========================
 def plot_overlay_chart(series_list, labels, title, ylabel, outfile, annotate_index=0, fmt_fn=fmt_home_value):
     if not series_list: return
@@ -879,12 +883,14 @@ def main():
             # 12-month ZIP backup table (ALL ZIPs) — CSV attachment only
             raw12, _fmt12 = build_zip_last12_table(zip_map)
             if not raw12.empty:
-                zcsv = out_dir / f"zip_last12_{dataset}_{re.sub(r'[^A-Za-z0-9\-]+', '_', area['name'])}.csv"
+                safe_area = slugify_name(area['name'])
+                zcsv = out_dir / f"zip_last12_{dataset}_{safe_area}.csv"
                 raw12.to_csv(zcsv)
                 csv_paths.append(str(zcsv))
 
             # Also attach the metrics table
-            zmet_csv = out_dir / f"zip_metrics_{dataset}_{re.sub(r'[^A-Za-z0-9\-]+', '_', area['name'])}.csv"
+            safe_area = slugify_name(area['name'])
+            zmet_csv = out_dir / f"zip_metrics_{dataset}_{safe_area}.csv"
             zdf.sort_values("yoy_pct", ascending=False).to_csv(zmet_csv, index=False)
             csv_paths.append(str(zmet_csv))
 
