@@ -1,10 +1,15 @@
 name: Zillow Monthly Emailer
 
 on:
-  # Run every day at 09:00 PT / 10:00 PDT (17:00 UTC) so we catch mid-month releases
+  # Run every day at 09:00 PST / 10:00 PDT (17:00 UTC) to catch mid-month releases
   schedule:
     - cron: '0 17 * * *'
-  workflow_dispatch: {}  # allow manual runs
+  workflow_dispatch:
+    inputs:
+      force_send:
+        description: 'Bypass release guard and send regardless of new data'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -25,7 +30,7 @@ jobs:
         with:
           python-version: '3.11'
 
-      # System deps for rtree (used by GeoPandas/labels)
+      # System deps for rtree (used by GeoPandas labeling)
       - name: Install system libraries
         run: |
           sudo apt-get update
@@ -36,8 +41,14 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run script
+      # If manual run with force_send=true, set FORCE_SEND=1 for this job
+      - name: Set FORCE_SEND if requested
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.force_send == true }}
+        run: echo "FORCE_SEND=1" >> "$GITHUB_ENV"
+
+      - name: Run Zillow Monthly Emailer
         env:
           GMAIL_APP_PWD: ${{ secrets.GMAIL_APP_PWD }}
+          # FORCE_SEND comes from $GITHUB_ENV if you toggled it above
         run: |
           python zillow_monthly_emailer.py
