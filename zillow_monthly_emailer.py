@@ -115,7 +115,6 @@ def _already_sent(asof: str, stamp_path: str) -> bool:
     try:
         with open(stamp_path, "r") as f:
             data = json.load(f)
-        # backward compat: old stamp had only {"last_sent": "..."}
         last_sent = data.get("last_sent")
         return (last_sent == asof)
     except Exception:
@@ -162,7 +161,6 @@ def _head_meta(url: str) -> dict:
         r = requests.head(url, headers=HEADERS, timeout=30, allow_redirects=True)
         lm = r.headers.get("Last-Modified")
         et = r.headers.get("ETag")
-        # normalize Last-Modified to ISO
         lm_iso = None
         if lm:
             try:
@@ -296,13 +294,11 @@ def smart_match_one(df_long: pd.DataFrame, target: str, geolevel_hint: str | Non
         parts = [
             rn.str.contains(re.escape(tn), na=False),
             cty.str.contains(re.escape(tn), na=False),
-            stn.str.contains(re.escape(tn), na=False),
+            stn.str_contains(re.escape(tn), na=False) if hasattr(stn, "str_contains") else stn.str.contains(re.escape(tn), na=False),
             st.str.contains(re.escape(tn), na=False),
         ]
         if "Metro" in df_long.columns:
-            parts.append(
-                metro.str.contains(re.escape(tn), na=False)
-            )
+            parts.append(metro.str.contains(re.escape(tn), na=False))
         mask = parts[0]
         for p in parts[1:]: mask |= p
         mask &= state_ok
@@ -1043,13 +1039,12 @@ def build_and_attach_zip_heatmaps(areas, out_dir: pathlib.Path, charts_list: lis
     except Exception as e:
         print(f"[WARN] Heatmap generation failed: {e}")
 
-# =========================== SMART RELEASE GUARD (NEW) ===========================
+# =========================== SMART RELEASE GUARD (month-advance only) ===========================
 def _latest_month_in_wide(df_wide: pd.DataFrame) -> str | None:
     if df_wide is None or df_wide.empty:
         return None
     date_cols = [c for c in df_wide.columns if re.fullmatch(r"\d{4}-\d{2}", str(c))]
     if not date_cols:
-        # try YYYY-MM-DD
         date_cols = [c for c in df_wide.columns if re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(c))]
         if not date_cols:
             return None
@@ -1072,7 +1067,6 @@ def _light_fetch_latest_months_and_headers() -> dict:
         url = find_csv_url(ds, lvl)
         meta = _head_meta(url)
         try:
-            # small GET to detect latest month (we still need columns)
             wide = load_wide_csv(url)
             latest = _latest_month_in_wide(wide)
         except Exception as e:
@@ -1083,41 +1077,26 @@ def _light_fetch_latest_months_and_headers() -> dict:
 
 def _is_new_release(stamp: dict, probe: dict) -> tuple[bool, str]:
     """
-    Decide if we should run:
-      - TRUE if latest month advanced for any key series
-      - OR Last-Modified/ETag changed relative to stamp (silent data refresh)
+    TRUE only if the latest YYYY-MM advanced beyond last_sent.
+    First run (no stamp) -> do NOT send (unless FORCE_SEND=1).
     """
-    # last time we sent
-    last_sent = (stamp or {}).get("last_sent")
-
-    # if FORCE_SEND, always run
     if os.getenv("FORCE_SEND", "").strip() == "1":
         return True, "FORCE_SEND=1"
 
-    reasons = []
-    advanced = False
-    changed_headers = False
+    last_sent = (stamp or {}).get("last_sent")
+    if not last_sent:
+        return False, "first run without stamp (skipping by default)"
 
+    advanced_reasons = []
     for k, cur in probe.items():
         latest = (cur or {}).get("latest_month")
-        if latest and last_sent and latest > last_sent:
-            advanced = True
-            reasons.append(f"{k} month advanced to {latest}")
+        if latest and latest > last_sent:
+            advanced_reasons.append(f"{k} advanced to {latest}")
 
-        # compare headers
-        prev_k = ((stamp or {}).get("head_meta") or {}).get(k, {})
-        if prev_k:
-            if (prev_k.get("last_modified") != cur.get("last_modified")) or (prev_k.get("etag") != cur.get("etag")):
-                changed_headers = True
-                reasons.append(f"{k} headers changed (LM/ETag)")
-        else:
-            # no previous meta; treat first run as new
-            changed_headers = True
-            reasons.append(f"{k} first-run or missing prior meta")
+    if advanced_reasons:
+        return True, "; ".join(advanced_reasons)
 
-    if advanced or changed_headers:
-        return True, "; ".join(reasons) if reasons else "new release detected"
-    return False, "no new month and headers unchanged"
+    return False, "no new month detected"
 
 # =============================== Main ===============================
 def main():
@@ -1126,7 +1105,8 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # ---- SMART RELEASE PROBE (fast) ----
-    stamp_path = str(pathlib.Path(OUT_DIR) / "_last_sent.json")
+    # Option A: track stamp in repo under ./state/_last_sent.json
+    stamp_path = str(pathlib.Path("state") / "_last_sent.json")
     prev = _read_stamp(stamp_path)
     probe = _light_fetch_latest_months_and_headers()
     should_run, reason = _is_new_release(prev, probe)
@@ -1141,7 +1121,6 @@ def main():
     prefetch_all()
 
     # ---- RUN-ONCE-PER-NEW-MONTH GUARD (based on data actually loaded) ----
-    # Use ZHVI Zip long for a definitive as-of month
     asof = _latest_available_month_for_guard()
     if not asof:
         print("[INFO] No latest month detected yet; exiting.")
@@ -1253,7 +1232,7 @@ def main():
     if charts or html_sections:
         email_charts_and_tables(charts, html_sections, csv_paths)
         stamp_meta = {
-            "head_meta": probe,  # store url + last-modified + etag + latest_month seen per key file
+            "head_meta": probe,  # store url + last-modified + etag + latest_month seen per key file (for reference)
         }
         _write_sent_extended(asof, stamp_path, stamp_meta)
     else:
