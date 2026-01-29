@@ -1,1 +1,23 @@
-{"last_sent": ""} 
+{
+  "last_sent": "2025-12",
+  "head_meta": {
+    "zhvi_zip": {
+      "url": "https://files.zillowstatic.com/research/public_csvs/zhvi/Zip_zhvi_uc_sfrcondo_tier_0.33_0.67_sm_sa_month.csv",
+      "latest_month": "2025-12",
+      "last_modified": "2026-01-16T02:30:42+00:00",
+      "etag": "\"3920dbf78ceab52e88e1de47e5d74b48-12\""
+    },
+    "zori_zip": {
+      "url": "https://files.zillowstatic.com/research/public_csvs/zori/Zip_zori_uc_sfrcondomfr_sm_month.csv",
+      "latest_month": "2025-12",
+      "last_modified": "2026-01-16T02:30:58+00:00",
+      "etag": "\"f2cc7e3ee31929e43aae7e7ce9691b96\""
+    },
+    "payment_metro": {
+      "url": "https://files.zillowstatic.com/research/public_csvs/total_monthly_payment/Metro_total_monthly_payment_downpayment_0.20_uc_sfrcondo_tier_0.33_0.67_sm_sa_month.csv",
+      "latest_month": "2025-12",
+      "last_modified": "2026-01-16T02:27:06+00:00",
+      "etag": "\"e302af948813c5f547b406e3c223a9d8\""
+    }
+  }
+}
