@@ -17,7 +17,7 @@ Notes:
   and output detailed CSVs with all intermediate columns used in calculations.
 """
 
-import io, re, ssl, smtplib, pathlib, warnings, requests, pandas as pd, matplotlib.pyplot as plt
+import io, re, ssl, smtplib, pathlib, warnings, requests, pandas as pd, matplotlib.pyplot as plt, numpy as np
 from datetime import datetime, timezone
 from bs4 import BeautifulSoup
 from dateutil.parser import parse as parse_date
@@ -25,13 +25,22 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.image import MIMEImage
 import unicodedata
-import os, json
+import os, json, sys
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 
 # ================= CONFIG =================
 EMAIL_USERNAME = "beluliproperties@gmail.com"
 
 APP_PWD = os.getenv("GMAIL_APP_PWD")
-assert APP_PWD, "Missing GMAIL_APP_PWD environment variable"
+DRY_RUN = os.getenv("DRY_RUN", "").strip() == "1"
+SKIP_HEATMAPS = os.getenv("SKIP_HEATMAPS", "").strip() == "1"
+if not APP_PWD and not DRY_RUN:
+    raise RuntimeError("Missing GMAIL_APP_PWD environment variable")
 
 EMAIL_TO = ["beluliproperties@gmail.com"]
 FROM_NAME = "Zillow Monthly Charts"
@@ -55,6 +64,21 @@ ZIP_TOP_UP = 5
 ZIP_TOP_DOWN = 2
 ZIP_MA_MONTHS = 3
 ZIP_RANK_MIN_MONTHS = 6
+
+# ----- National dashboard-style scanner controls -----
+NATIONAL_TOP_N = 20
+NATIONAL_CHART_N = 15
+NATIONAL_MIN_HISTORY_MONTHS = 36
+NATIONAL_MAX_SIZE_RANK = 15000
+NATIONAL_MIN_CONFIDENCE = 55.0
+EXTREME_MOVE_PCT = 25.0
+
+# ----- Sacramento permit add-on -----
+SACRAMENTO_PERMIT_SOURCE_URL = "https://data.cityofsacramento.org/datasets/issued-building-permits-current-year/explore"
+SACRAMENTO_FEATURE_SERVICE_URL = (
+    "https://services5.arcgis.com/54falWtcpty3V47Z/arcgis/rest/services/"
+    "BldgPermitIssued_CurrentYear/FeatureServer/0"
+)
 
 # ----------------- AREAS -----------------
 AREAS = [
@@ -810,6 +834,488 @@ def build_metro_investment_tables(areas: list[dict], out_dir: pathlib.Path) -> t
 
     return rental_path if not rental_df.empty else "", flip_path if not flip_df.empty else ""
 
+# ========================== Dashboard-style ZIP scanner ==========================
+def _series_key(df: pd.DataFrame) -> pd.Series:
+    if "RegionID" in df.columns:
+        return df["RegionID"].astype(str)
+    state = df["State"].astype(str) if "State" in df.columns else ""
+    return df["RegionName"].astype(str) + "|" + state
+
+def _value_frame_at_dates(df_long: pd.DataFrame, prefix: str, dates: dict[str, pd.Timestamp]) -> pd.DataFrame:
+    if df_long.empty:
+        return pd.DataFrame()
+    df = df_long.copy()
+    df["__key"] = _series_key(df)
+    df["date"] = pd.to_datetime(df["date"]).map(month_floor)
+    wanted_dates = set(dates.values())
+    sub = df[df["date"].isin(wanted_dates)].copy()
+    if sub.empty:
+        return pd.DataFrame()
+    pivot = sub.pivot_table(index="__key", columns="date", values="value", aggfunc="mean")
+    out = pd.DataFrame({"__key": pivot.index})
+    for label, dt in dates.items():
+        out[f"{prefix}_{label}"] = pivot[dt].values if dt in pivot.columns else pd.NA
+    hist = df.groupby("__key")["value"].count().rename(f"{prefix}_history_months").reset_index()
+    recent_cutoff = month_floor(dates["latest"] - pd.DateOffset(months=7))
+    recent = df[df["date"] >= recent_cutoff].sort_values(["__key", "date"]).copy()
+    recent["pct_change"] = recent.groupby("__key")["value"].pct_change() * 100.0
+    vol = recent.groupby("__key")["pct_change"].std().rename(f"{prefix}_recent_volatility").reset_index()
+    return out.merge(hist, on="__key", how="left").merge(vol, on="__key", how="left")
+
+def _metadata_frame(df_long: pd.DataFrame) -> pd.DataFrame:
+    if df_long.empty:
+        return pd.DataFrame()
+    df = df_long.copy()
+    df["__key"] = _series_key(df)
+    meta_cols = [
+        c for c in [
+            "RegionID", "SizeRank", "RegionName", "RegionType", "StateName",
+            "State", "City", "Metro", "CountyName"
+        ] if c in df.columns
+    ]
+    return df[["__key"] + meta_cols].drop_duplicates("__key")
+
+def _pct(now: pd.Series, prev: pd.Series) -> pd.Series:
+    now = pd.to_numeric(now, errors="coerce")
+    prev = pd.to_numeric(prev, errors="coerce")
+    return np.where((prev.notna()) & (prev != 0) & (now.notna()), (now / prev - 1.0) * 100.0, np.nan)
+
+def _quality_flags(row: pd.Series) -> str:
+    flags = []
+    if pd.notna(row.get("rent_yoy_pct")) and abs(float(row["rent_yoy_pct"])) >= EXTREME_MOVE_PCT:
+        flags.append("extreme rent YoY")
+    if pd.notna(row.get("value_yoy_pct")) and abs(float(row["value_yoy_pct"])) >= EXTREME_MOVE_PCT:
+        flags.append("extreme value YoY")
+    if pd.notna(row.get("SizeRank")) and float(row["SizeRank"]) > NATIONAL_MAX_SIZE_RANK:
+        flags.append("smaller Zillow market")
+    if pd.notna(row.get("both_history_months")) and float(row["both_history_months"]) < NATIONAL_MIN_HISTORY_MONTHS:
+        flags.append("short history")
+    if pd.notna(row.get("confidence_score")) and float(row["confidence_score"]) < NATIONAL_MIN_CONFIDENCE:
+        flags.append("low confidence")
+    return "; ".join(flags)
+
+def build_zip_market_snapshot() -> tuple[pd.DataFrame, str]:
+    zori = get_long_df("zori", "Zip")
+    zhvi = get_long_df("zhvi", "Zip")
+    if zori.empty or zhvi.empty:
+        return pd.DataFrame(), ""
+    latest = min(month_floor(pd.Timestamp(zori["date"].max())), month_floor(pd.Timestamp(zhvi["date"].max())))
+    dates = {
+        "latest": latest,
+        "yearago": month_floor(latest - pd.DateOffset(years=1)),
+        "m3": month_floor(latest - pd.DateOffset(months=3)),
+        "m6": month_floor(latest - pd.DateOffset(months=6)),
+    }
+    rent = _value_frame_at_dates(zori, "rent", dates)
+    value = _value_frame_at_dates(zhvi, "value", dates)
+    meta = _metadata_frame(zhvi)
+    if rent.empty or value.empty or meta.empty:
+        return pd.DataFrame(), latest.strftime("%Y-%m")
+
+    out = meta.merge(rent, on="__key", how="inner").merge(value, on="__key", how="inner")
+    out["rent_yoy_pct"] = _pct(out["rent_latest"], out["rent_yearago"])
+    out["value_yoy_pct"] = _pct(out["value_latest"], out["value_yearago"])
+    out["rent_3m_pct"] = _pct(out["rent_latest"], out["rent_m3"])
+    out["value_3m_pct"] = _pct(out["value_latest"], out["value_m3"])
+    out["rent_6m_pct"] = _pct(out["rent_latest"], out["rent_m6"])
+    out["value_6m_pct"] = _pct(out["value_latest"], out["value_m6"])
+    out["rent_momentum_delta_pct"] = out["rent_3m_pct"] - out["rent_6m_pct"]
+    out["value_momentum_delta_pct"] = out["value_3m_pct"] - out["value_6m_pct"]
+    out["opportunity_gap_pct"] = out["rent_yoy_pct"] - out["value_yoy_pct"]
+    out["gross_rent_yield_pct"] = np.where(
+        pd.to_numeric(out["value_latest"], errors="coerce") > 0,
+        pd.to_numeric(out["rent_latest"], errors="coerce") * 12.0 / pd.to_numeric(out["value_latest"], errors="coerce") * 100.0,
+        np.nan,
+    )
+    out["both_history_months"] = np.minimum(
+        pd.to_numeric(out["rent_history_months"], errors="coerce"),
+        pd.to_numeric(out["value_history_months"], errors="coerce"),
+    )
+    state_series = out["State"].astype(str) if "State" in out.columns else pd.Series("", index=out.index)
+    out["label"] = out["RegionName"].astype(str).str.zfill(5) + ", " + state_series
+
+    size_rank = pd.to_numeric(out.get("SizeRank"), errors="coerce")
+    size_score = (100.0 - ((size_rank - 1.0) / max(float(NATIONAL_MAX_SIZE_RANK), 1.0) * 100.0)).clip(0, 100).fillna(50)
+    history_score = (pd.to_numeric(out["both_history_months"], errors="coerce") / 60.0 * 100.0).clip(0, 100).fillna(0)
+    volatility = pd.concat([
+        pd.to_numeric(out.get("rent_recent_volatility"), errors="coerce"),
+        pd.to_numeric(out.get("value_recent_volatility"), errors="coerce"),
+    ], axis=1).mean(axis=1)
+    stability_score = (100.0 - volatility.fillna(0) * 8.0).clip(0, 100)
+    out["confidence_score"] = size_score * 0.45 + history_score * 0.35 + stability_score * 0.20
+    out["quality_flags"] = out.apply(_quality_flags, axis=1)
+
+    out["opportunity_score"] = (
+        pd.to_numeric(out["opportunity_gap_pct"], errors="coerce").rank(pct=True) * 35.0
+        + pd.to_numeric(out["gross_rent_yield_pct"], errors="coerce").rank(pct=True) * 30.0
+        + pd.to_numeric(out["rent_yoy_pct"], errors="coerce").rank(pct=True) * 20.0
+        + (-pd.to_numeric(out["value_yoy_pct"], errors="coerce").clip(-20, 20)).rank(pct=True) * 15.0
+    )
+    out["cash_flow_score"] = (
+        pd.to_numeric(out["gross_rent_yield_pct"], errors="coerce").rank(pct=True) * 45.0
+        + pd.to_numeric(out["opportunity_gap_pct"], errors="coerce").rank(pct=True) * 25.0
+        + pd.to_numeric(out["rent_yoy_pct"], errors="coerce").rank(pct=True) * 20.0
+        + (-pd.to_numeric(out["value_yoy_pct"], errors="coerce").clip(-20, 20)).rank(pct=True) * 10.0
+    )
+    return out.sort_values("cash_flow_score", ascending=False), latest.strftime("%Y-%m")
+
+def _scanner_filter(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    out = out[pd.to_numeric(out["both_history_months"], errors="coerce") >= NATIONAL_MIN_HISTORY_MONTHS]
+    out = out[pd.to_numeric(out["confidence_score"], errors="coerce") >= NATIONAL_MIN_CONFIDENCE]
+    if "SizeRank" in out.columns:
+        out = out[pd.to_numeric(out["SizeRank"], errors="coerce") <= NATIONAL_MAX_SIZE_RANK]
+    return out.dropna(subset=["rent_yoy_pct", "value_yoy_pct", "opportunity_gap_pct", "gross_rent_yield_pct"])
+
+def _plot_barh(df: pd.DataFrame, label_col: str, value_col: str, title: str, outfile: pathlib.Path, color_col: str | None = None):
+    if df.empty:
+        return
+    data = df.tail(len(df)).copy()
+    labels = data[label_col].astype(str)
+    values = pd.to_numeric(data[value_col], errors="coerce")
+    if values.notna().sum() == 0:
+        return
+    colors = "#2f80ed"
+    if color_col and color_col in data.columns:
+        cvals = pd.to_numeric(data[color_col], errors="coerce")
+        if cvals.notna().sum() > 0:
+            denom = cvals.max() - cvals.min()
+            if pd.isna(denom) or denom == 0:
+                denom = 1.0
+            colors = plt.cm.viridis(((cvals - cvals.min()) / denom).fillna(0.5))
+    plt.figure(figsize=(11, 7), dpi=150)
+    plt.barh(labels, values, color=colors)
+    plt.title(title, fontsize=12)
+    plt.xlabel(value_col)
+    plt.grid(True, axis="x", linestyle="--", alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(outfile, bbox_inches="tight")
+    plt.close()
+
+def _plot_opportunity_scatter(df: pd.DataFrame, title: str, outfile: pathlib.Path):
+    if df.empty:
+        return
+    plot_df = df.dropna(subset=["value_yoy_pct", "rent_yoy_pct", "gross_rent_yield_pct"]).copy()
+    if plot_df.empty:
+        return
+    size = pd.to_numeric(plot_df["confidence_score"], errors="coerce").clip(30, 100).fillna(50)
+    color = pd.to_numeric(plot_df["gross_rent_yield_pct"], errors="coerce")
+    plt.figure(figsize=(10, 7), dpi=150)
+    sc = plt.scatter(
+        plot_df["value_yoy_pct"], plot_df["rent_yoy_pct"],
+        s=size * 2.0, c=color, cmap="viridis", alpha=0.72, edgecolors="white", linewidths=0.5
+    )
+    plt.axline((0, 0), slope=1, color="#999", linestyle="--", linewidth=1)
+    label_df = plot_df.sort_values("cash_flow_score", ascending=False).head(12)
+    for _, r in label_df.iterrows():
+        plt.annotate(str(r["label"]), (r["value_yoy_pct"], r["rent_yoy_pct"]), fontsize=8, xytext=(4, 4), textcoords="offset points")
+    plt.colorbar(sc, label="Gross rent yield %")
+    plt.title(title, fontsize=12)
+    plt.xlabel("Home value YoY %")
+    plt.ylabel("Rent YoY %")
+    plt.grid(True, linestyle="--", alpha=0.25)
+    plt.tight_layout()
+    plt.savefig(outfile, bbox_inches="tight")
+    plt.close()
+
+def _format_scanner_table(df: pd.DataFrame) -> pd.DataFrame:
+    cols = [
+        c for c in [
+            "label", "Metro", "CountyName", "rent_latest", "value_latest", "rent_yoy_pct",
+            "value_yoy_pct", "opportunity_gap_pct", "gross_rent_yield_pct", "cash_flow_score",
+            "confidence_score", "quality_flags"
+        ] if c in df.columns
+    ]
+    out = df[cols].copy()
+    for c in ["rent_latest", "value_latest"]:
+        if c in out.columns:
+            out[c] = out[c].map(fmt_money)
+    for c in ["rent_yoy_pct", "value_yoy_pct", "opportunity_gap_pct", "gross_rent_yield_pct"]:
+        if c in out.columns:
+            out[c] = out[c].map(fmt_pct)
+    for c in ["cash_flow_score", "confidence_score"]:
+        if c in out.columns:
+            out[c] = out[c].map(lambda v: "" if pd.isna(v) else f"{float(v):.1f}")
+    return out
+
+def build_dashboard_scanner_outputs(out_dir: pathlib.Path, charts: list, csv_paths: list, html_sections: list):
+    snapshot, latest = build_zip_market_snapshot()
+    if snapshot.empty:
+        print("[WARN] National ZIP scanner could not build a rent/value snapshot.")
+        return
+    full_csv = out_dir / "national_zip_market_scanner.csv"
+    snapshot.to_csv(full_csv, index=False)
+    csv_paths.append(str(full_csv))
+
+    filtered = _scanner_filter(snapshot)
+    if filtered.empty:
+        print("[WARN] National ZIP scanner has no rows after confidence filters.")
+        return
+
+    opportunities = filtered.sort_values("cash_flow_score", ascending=False).head(NATIONAL_TOP_N)
+    opp_csv = out_dir / "national_top_zip_opportunities.csv"
+    opportunities.to_csv(opp_csv, index=False)
+    csv_paths.append(str(opp_csv))
+    html_sections.append(table_to_html(_format_scanner_table(opportunities), f"National ZIP Opportunities ({latest})"))
+
+    opp_chart = out_dir / "national_zip_cash_flow_opportunities.png"
+    _plot_barh(
+        opportunities.sort_values("cash_flow_score").tail(NATIONAL_CHART_N),
+        "label",
+        "cash_flow_score",
+        "National ZIP cash-flow opportunity score",
+        opp_chart,
+        color_col="gross_rent_yield_pct",
+    )
+    charts.append(("National ZIP cash-flow opportunities", str(opp_chart)))
+
+    scatter_chart = out_dir / "national_zip_rent_value_gap_scatter.png"
+    _plot_opportunity_scatter(
+        filtered.sort_values("cash_flow_score", ascending=False).head(300),
+        "Rent growth vs home value growth (higher above line = rent leading values)",
+        scatter_chart,
+    )
+    charts.append(("National rent growth vs value growth", str(scatter_chart)))
+
+    rent_growth = filtered.sort_values("rent_yoy_pct", ascending=False).head(NATIONAL_TOP_N)
+    rent_csv = out_dir / "national_top_zip_rent_growth.csv"
+    rent_growth.to_csv(rent_csv, index=False)
+    csv_paths.append(str(rent_csv))
+    rent_chart = out_dir / "national_top_zip_rent_growth.png"
+    _plot_barh(rent_growth.sort_values("rent_yoy_pct").tail(NATIONAL_CHART_N), "label", "rent_yoy_pct", "National ZIP rent YoY leaders", rent_chart, color_col="confidence_score")
+    charts.append(("National ZIP rent growth leaders", str(rent_chart)))
+
+    value_growth = filtered.sort_values("value_yoy_pct", ascending=False).head(NATIONAL_TOP_N)
+    value_csv = out_dir / "national_top_zip_value_growth.csv"
+    value_growth.to_csv(value_csv, index=False)
+    csv_paths.append(str(value_csv))
+    value_chart = out_dir / "national_top_zip_value_growth.png"
+    _plot_barh(value_growth.sort_values("value_yoy_pct").tail(NATIONAL_CHART_N), "label", "value_yoy_pct", "National ZIP home value YoY leaders", value_chart, color_col="confidence_score")
+    charts.append(("National ZIP value growth leaders", str(value_chart)))
+
+    slowdown = filtered.sort_values("rent_momentum_delta_pct", ascending=True).head(NATIONAL_TOP_N)
+    slowdown_csv = out_dir / "national_zip_rent_slowdown.csv"
+    slowdown.to_csv(slowdown_csv, index=False)
+    csv_paths.append(str(slowdown_csv))
+    slow_chart = out_dir / "national_zip_rent_slowdown.png"
+    _plot_barh(slowdown.sort_values("rent_momentum_delta_pct", ascending=False).tail(NATIONAL_CHART_N), "label", "rent_momentum_delta_pct", "National ZIP rent momentum slowdown", slow_chart, color_col="confidence_score")
+    charts.append(("National ZIP rent slowdown", str(slow_chart)))
+
+    for area in AREAS:
+        resolved = _resolve_metro_name("zori", area["metro"]) or area["metro"]
+        area_rows = filtered[filtered.get("Metro", "").astype(str).map(_norm_msa) == _norm_msa(resolved)].copy()
+        if area_rows.empty:
+            continue
+        area_top = area_rows.sort_values("cash_flow_score", ascending=False).head(NATIONAL_TOP_N)
+        safe_area = slugify_name(area["name"])
+        area_csv = out_dir / f"{safe_area}_zip_opportunities_dashboard.csv"
+        area_top.to_csv(area_csv, index=False)
+        csv_paths.append(str(area_csv))
+        html_sections.append(table_to_html(_format_scanner_table(area_top.head(12)), f"{area['name']} ZIP Opportunities ({latest})"))
+        area_chart = out_dir / f"{safe_area}_zip_opportunities_dashboard.png"
+        _plot_barh(
+            area_top.sort_values("cash_flow_score").tail(min(NATIONAL_CHART_N, len(area_top))),
+            "label",
+            "cash_flow_score",
+            f"{area['name']} ZIP cash-flow opportunities",
+            area_chart,
+            color_col="gross_rent_yield_pct",
+        )
+        charts.append((f"{area['name']} ZIP dashboard opportunities", str(area_chart)))
+
+# ========================== Sacramento permit and contractor add-on ==========================
+SAC_NEW_SUPPLY_TERMS = (
+    r"\bn1 new construction\b", r"\bnew construction\b", r"\bnew,?\s+plan number\b",
+    r"\bproduction permit\b", r"\bnew building\b", r"\bnew single family\b",
+    r"\bnew duplex\b", r"\bnew triplex\b", r"\bnew fourplex\b", r"\bnew apartment\b",
+    r"\bnew multifamily\b", r"\bnew multi-family\b", r"\bdetached adu\b", r"\bnew adu\b",
+    r"\baccessory dwelling\b",
+)
+SAC_RENO_TERMS = (
+    "remodel", "renovation", "alteration", "addition", "repair", "kitchen", "bath",
+    "bathroom", "window", "reroof", "roof", "hvac", "plumbing", "electrical", "panel", "solar",
+)
+SAC_MAINT_TERMS = (
+    "reroof", "roof", "hvac", "water heater", "sewer", "electrical", "panel",
+    "plumbing", "window", "solar", "battery", "ev charger", "repair",
+)
+SAC_PHASE_PATTERNS = (
+    ("Demolition", r"\bw1 wreck\b|\bdemolition\b|\bdemo\b|\bwreck\b"),
+    ("Grading / sitework", r"\bgrading\b|\bsitework\b|\bsite work\b|\bdrainage\b|\berosion\b|\bsubdivision\b|\btrench"),
+    ("Foundation / structural", r"\bfoundation\b|\bstructural\b|\bretaining wall\b|\bseismic\b|\bunderpin"),
+    ("Framing / shell", r"\bframing\b|\bframe\b|\btruss\b|\bshear wall\b|\bshell\b"),
+    ("ADU / conversion", r"\badu\b|\baccessory dwelling\b|\bgarage conversion\b"),
+    ("New residential construction", "|".join(SAC_NEW_SUPPLY_TERMS)),
+    ("Interior remodel / addition", r"\bremodel\b|\brenovation\b|\balteration\b|\baddition\b|\binterior\b|\bkitchen\b|\bbath\b|\btenant improvement\b|\bti/com\b"),
+    ("Roofing", r"\breroof\b|\broof\b"),
+    ("HVAC / mechanical", r"\bhvac\b|\bheating\b|\bair condition|\bheat pump\b|\bfurnace\b|\bduct\b|\bmechanical\b"),
+    ("Plumbing / water", r"\bplumbing\b|\bwater heater\b|\bsewer\b|\bre-pipe\b|\brepipe\b|\bwater re-pipe\b"),
+    ("Solar / battery / EV", r"\bsolar\b|\bphotovoltaic\b|\bpv\b|\bess\b|\bbattery\b|\bev charger\b|\belectric vehicle\b"),
+    ("Electrical", r"\belec\b|\belectrical\b|\bpanel\b|\bservice change\b|\bmain panel\b|\bmeter\b|\btemporary power\b"),
+    ("Fire / life safety", r"\bfire alarm\b|\bsmoke det\b|\bsprinkler\b|\bfire hood\b|\bfire repair\b"),
+    ("Pool / outdoor", r"\bswimming pool\b|\bpool\b|\bspa\b|\bdeck\b|\bpatio\b|\bporch\b"),
+    ("Code / housing repair", r"\bhousing case\b|\bhousing cases\b|\bhousing dept\b|\bgeneral repair\b|\bfix-it\b"),
+)
+
+def _zip5(series: pd.Series) -> pd.Series:
+    return series.fillna("").astype(str).str.extract(r"(\d{5})", expand=False).fillna("").str.zfill(5)
+
+def _sac_text_blob(df: pd.DataFrame) -> pd.Series:
+    cols = [c for c in ["Type", "Sub_Type", "Category", "Activity_Code", "Work_Desc", "Project_Name"] if c in df.columns]
+    if not cols:
+        return pd.Series("", index=df.index)
+    return df[cols].fillna("").astype(str).agg(" ".join, axis=1).str.lower()
+
+def _sac_work_phase(text: pd.Series) -> pd.Series:
+    phase = pd.Series("Other", index=text.index, dtype="object")
+    unmatched = pd.Series(True, index=text.index)
+    for label, pattern in SAC_PHASE_PATTERNS:
+        matches = unmatched & text.str.contains(pattern, regex=True, na=False)
+        phase.loc[matches] = label
+        unmatched.loc[matches] = False
+    return phase
+
+def _join_unique(values: pd.Series, limit: int = 6) -> str:
+    vals = sorted(v for v in values.dropna().astype(str).str.strip().unique().tolist() if v and v != "00000")
+    return ", ".join(vals[:limit]) + (f" +{len(vals) - limit}" if len(vals) > limit else "")
+
+def _top_counts(values: pd.Series, limit: int = 4) -> str:
+    vals = values.dropna().astype(str).str.strip()
+    vals = vals[vals != ""]
+    if vals.empty:
+        return ""
+    return ", ".join(f"{k} ({v})" for k, v in vals.value_counts().head(limit).items())
+
+def download_sacramento_permits() -> pd.DataFrame:
+    count_response = requests.get(
+        f"{SACRAMENTO_FEATURE_SERVICE_URL}/query",
+        params={"where": "1=1", "returnCountOnly": "true", "f": "json"},
+        timeout=60,
+    )
+    count_response.raise_for_status()
+    total = int(count_response.json().get("count", 0))
+    rows = []
+    for offset in range(0, total, 2000):
+        response = requests.get(
+            f"{SACRAMENTO_FEATURE_SERVICE_URL}/query",
+            params={
+                "where": "1=1", "outFields": "*", "returnGeometry": "false", "f": "json",
+                "resultOffset": offset, "resultRecordCount": 2000, "orderByFields": "OBJECTID",
+            },
+            timeout=120,
+        )
+        response.raise_for_status()
+        rows.extend(feature.get("attributes", {}) for feature in response.json().get("features", []))
+    return pd.DataFrame(rows)
+
+def prepare_sacramento_permits(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out["zip_code"] = _zip5(out.get("ZIP", pd.Series("", index=out.index)))
+    out["status_date"] = pd.to_datetime(out.get("Status_Date"), errors="coerce")
+    out["house_count_clean"] = pd.to_numeric(out.get("House_Count"), errors="coerce").fillna(0).clip(lower=0)
+    out["valuation_clean"] = pd.to_numeric(out.get("Valuation"), errors="coerce").fillna(0).clip(lower=0)
+    out["contractor_clean"] = out.get("Contractor", pd.Series("", index=out.index)).fillna("").astype(str).str.strip()
+    out["address_clean"] = out.get("Address", pd.Series("", index=out.index)).fillna("").astype(str).str.strip()
+    out["site_location_clean"] = out.get("Site_Location", pd.Series("", index=out.index)).fillna("").astype(str).str.strip()
+    text = _sac_text_blob(out)
+    out["work_phase"] = _sac_work_phase(text)
+    new_text = text.str.contains("|".join(SAC_NEW_SUPPLY_TERMS), regex=True, na=False)
+    reno_text = text.str.contains("|".join(SAC_RENO_TERMS), regex=True, na=False)
+    maint_text = text.str.contains("|".join(SAC_MAINT_TERMS), regex=True, na=False)
+    demo_text = text.str.contains(r"\bw1 wreck\b|\bdemolition\b|\bdemo\b|\bwreck\b", regex=True, na=False)
+    activity = out.get("Activity_Code", pd.Series("", index=out.index)).fillna("").astype(str)
+    subtype = out.get("Sub_Type", pd.Series("", index=out.index)).fillna("").astype(str)
+    category = out.get("Category", pd.Series("", index=out.index)).fillna("").astype(str)
+    type_col = out.get("Type", pd.Series("", index=out.index)).fillna("").astype(str)
+    out["is_residential"] = type_col.str.contains("residential", case=False, na=False) | category.str.contains(
+        "single family|duplex|triplex|fourplex|plex|multi|apart|apt|apts|condo|town|mixed use|mix-use",
+        case=False, regex=True, na=False,
+    )
+    explicit_new = activity.str.contains("N1 NEW CONSTRUCTION", case=False, na=False) | subtype.str.contains(
+        "Production Permit|New Building", case=False, regex=True, na=False
+    )
+    phase_new = out["work_phase"].isin(["New residential construction", "ADU / conversion"])
+    out["is_new_residential_supply"] = out["is_residential"] & (explicit_new | new_text | ((out["house_count_clean"] > 0) & phase_new)) & ~demo_text
+    out["is_renovation_like"] = out["is_residential"] & (reno_text | maint_text) & ~out["is_new_residential_supply"] & ~demo_text
+    return out
+
+def build_sacramento_permit_outputs(out_dir: pathlib.Path, charts: list, csv_paths: list, html_sections: list):
+    if not any(normalize_text(a.get("name")) == "sacramento" for a in AREAS):
+        return
+    try:
+        permits = prepare_sacramento_permits(download_sacramento_permits())
+    except Exception as e:
+        print(f"[WARN] Sacramento permit feed failed: {e}")
+        return
+    if permits.empty:
+        return
+    site_cols = [
+        c for c in [
+            "status_date", "zip_code", "Address", "Site_Location", "Contractor", "work_phase",
+            "Activity_Code", "Type", "Sub_Type", "Category", "House_Count", "Valuation",
+            "Project_Name", "Work_Desc", "is_new_residential_supply", "is_renovation_like"
+        ] if c in permits.columns
+    ]
+    site_csv = out_dir / "sacramento_site_level_permits.csv"
+    permits.sort_values("status_date", ascending=False)[site_cols].to_csv(site_csv, index=False)
+    csv_paths.append(str(site_csv))
+
+    zip_summary = permits[(permits["zip_code"] != "") & (permits["zip_code"] != "00000")].groupby("zip_code", as_index=False).agg(
+        permit_count=("zip_code", "size"),
+        new_residential_permit_count=("is_new_residential_supply", "sum"),
+        renovation_permit_count=("is_renovation_like", "sum"),
+        housing_units=("house_count_clean", "sum"),
+        valuation_sum=("valuation_clean", "sum"),
+        contractor_count=("contractor_clean", lambda s: s[s != ""].nunique()),
+        top_contractors=("contractor_clean", _top_counts),
+    ).sort_values(["housing_units", "new_residential_permit_count", "renovation_permit_count"], ascending=False)
+    zip_csv = out_dir / "sacramento_permit_zip_summary.csv"
+    zip_summary.to_csv(zip_csv, index=False)
+    csv_paths.append(str(zip_csv))
+
+    contractors = permits[permits["contractor_clean"] != ""].groupby("contractor_clean", as_index=False).agg(
+        permit_count=("contractor_clean", "size"),
+        new_residential_permit_count=("is_new_residential_supply", "sum"),
+        renovation_permit_count=("is_renovation_like", "sum"),
+        housing_units=("house_count_clean", "sum"),
+        valuation_sum=("valuation_clean", "sum"),
+        zip_codes=("zip_code", _join_unique),
+        top_work_phases=("work_phase", _top_counts),
+        latest_permit_date=("status_date", "max"),
+    ).sort_values(["new_residential_permit_count", "renovation_permit_count", "permit_count"], ascending=False)
+    contractor_csv = out_dir / "sacramento_top_contractors.csv"
+    contractors.to_csv(contractor_csv, index=False)
+    csv_paths.append(str(contractor_csv))
+
+    html_sections.append(table_to_html(
+        _format_sac_table(contractors.head(15)),
+        "Sacramento Permit Contractors"
+    ))
+
+    units_chart = out_dir / "sacramento_new_housing_units_by_zip.png"
+    _plot_barh(zip_summary.sort_values("housing_units").tail(15), "zip_code", "housing_units", "Sacramento new housing units by ZIP", units_chart, color_col="valuation_sum")
+    charts.append(("Sacramento new housing units by ZIP", str(units_chart)))
+
+    reno_chart = out_dir / "sacramento_renovation_permits_by_zip.png"
+    _plot_barh(zip_summary.sort_values("renovation_permit_count").tail(15), "zip_code", "renovation_permit_count", "Sacramento renovation/improvement permits by ZIP", reno_chart, color_col="valuation_sum")
+    charts.append(("Sacramento renovation permits by ZIP", str(reno_chart)))
+
+    contractor_chart = out_dir / "sacramento_top_contractors.png"
+    _plot_barh(contractors.head(15).sort_values("permit_count"), "contractor_clean", "permit_count", "Sacramento active contractors by permit count", contractor_chart, color_col="housing_units")
+    charts.append(("Sacramento active contractors", str(contractor_chart)))
+
+def _format_sac_table(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for c in ["valuation_sum"]:
+        if c in out.columns:
+            out[c] = out[c].map(fmt_money)
+    for c in ["permit_count", "new_residential_permit_count", "renovation_permit_count", "housing_units"]:
+        if c in out.columns:
+            out[c] = out[c].map(lambda v: "" if pd.isna(v) else f"{float(v):,.0f}")
+    return out
+
 # =============================== ZIP Choropleth Heatmaps (NEW) ===============================
 def _ensure_packages_for_maps():
     try:
@@ -1132,6 +1638,9 @@ def main():
     series_catalog = {"zhvi": {}, "zori": {}}
     html_sections = []
 
+    # Dashboard-style national and monitored-area opportunity scans.
+    build_dashboard_scanner_outputs(out_dir, charts, csv_paths, html_sections)
+
     for dataset in ("zhvi", "zori"):
         ylabel = "Typical Home Value ($)" if dataset == "zhvi" else "Typical Rent ($)"
         fmt_fn = fmt_home_value if dataset == "zhvi" else fmt_rent_exact
@@ -1225,11 +1734,21 @@ def main():
     if rental_csv: csv_paths.append(rental_csv)
     if flip_csv:   csv_paths.append(flip_csv)
 
+    # -------- Sacramento local permit and contractor intelligence --------
+    build_sacramento_permit_outputs(out_dir, charts, csv_paths, html_sections)
+
     # -------- ZIP Choropleth Heatmaps --------
-    build_and_attach_zip_heatmaps(AREAS, out_dir, charts)
+    if SKIP_HEATMAPS:
+        print("[INFO] SKIP_HEATMAPS=1; skipping ZIP choropleth heatmaps.")
+    else:
+        build_and_attach_zip_heatmaps(AREAS, out_dir, charts)
 
     # Email all results, then record extended stamp
     if charts or html_sections:
+        if DRY_RUN:
+            print(f"[DRY_RUN] Generated {len(charts)} charts and {len(csv_paths)} CSV attachments.")
+            print(f"[DRY_RUN] Output directory: {out_dir.resolve()}")
+            return
         email_charts_and_tables(charts, html_sections, csv_paths)
         stamp_meta = {
             "head_meta": probe,  # store url + last-modified + etag + latest_month seen per key file (for reference)
