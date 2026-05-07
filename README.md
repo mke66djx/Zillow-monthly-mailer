@@ -67,3 +67,12 @@ This branch also includes a first product plan for turning the monthly market pi
 - [Report and dashboard product spec](docs/03_REPORT_AND_DASHBOARD_SPEC.md)
 - [30-day content calendar](docs/04_CONTENT_CALENDAR_30_DAYS.csv)
 - [First issue runbook](docs/05_FIRST_ISSUE_RUNBOOK.md)
+
+## Product System Docs
+
+These files define how the product should be built from here forward. Read the constitution before changing product behavior, scoring, data quality, source ingestion, dashboard UX, or mailer outputs.
+
+- [Operating flow](docs/06_OPERATING_FLOW.md)
+- [Product blueprint](docs/07_PRODUCT_BLUEPRINT.md)
+- [Reference architecture](docs/08_REFERENCE_ARCHITECTURE.md)
+- [Engineering constitution](docs/09_ENGINEERING_CONSTITUTION.md)
