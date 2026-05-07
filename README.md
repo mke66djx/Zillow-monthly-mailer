@@ -57,3 +57,13 @@ Outputs are written to:
 ```text
 ZillowMonthly
 ```
+
+## Product Launch Docs
+
+This branch also includes a first product plan for turning the monthly market pipeline into `Sacramento Investor Radar`, starting with an email list and growing into a paid California investor dashboard.
+
+- [Executable launch plan](docs/01_EXECUTABLE_LAUNCH_PLAN.md)
+- [Landing page and email copy](docs/02_LANDING_PAGE_AND_EMAIL_KIT.md)
+- [Report and dashboard product spec](docs/03_REPORT_AND_DASHBOARD_SPEC.md)
+- [30-day content calendar](docs/04_CONTENT_CALENDAR_30_DAYS.csv)
+- [First issue runbook](docs/05_FIRST_ISSUE_RUNBOOK.md)
