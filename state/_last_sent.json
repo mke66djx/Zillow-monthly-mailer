@@ -1,23 +1,23 @@
 {
-  "last_sent": "2026-04",
+  "last_sent": "2026-05",
   "head_meta": {
     "zhvi_zip": {
       "url": "https://files.zillowstatic.com/research/public_csvs/zhvi/Zip_zhvi_uc_sfrcondo_tier_0.33_0.67_sm_sa_month.csv",
-      "latest_month": "2026-04",
-      "last_modified": "2026-05-16T02:05:06+00:00",
-      "etag": "\"cba9dd2517bba3b1269f33f51332b7d3-12\""
+      "latest_month": "2026-05",
+      "last_modified": "2026-06-16T02:10:22+00:00",
+      "etag": "\"fa51220e5bb78b079d0a0b47a723580f-12\""
     },
     "zori_zip": {
       "url": "https://files.zillowstatic.com/research/public_csvs/zori/Zip_zori_uc_sfrcondomfr_sm_month.csv",
-      "latest_month": "2026-04",
-      "last_modified": "2026-05-16T02:05:42+00:00",
-      "etag": "\"792da04c4a45e0a01061d3957a2ee401\""
+      "latest_month": "2026-05",
+      "last_modified": "2026-06-16T02:11:02+00:00",
+      "etag": "\"13a503bd7e15639e8a009ec7d1779bfa\""
     },
     "payment_metro": {
       "url": "https://files.zillowstatic.com/research/public_csvs/total_monthly_payment/Metro_total_monthly_payment_downpayment_0.20_uc_sfrcondo_tier_0.33_0.67_sm_sa_month.csv",
-      "latest_month": "2026-04",
-      "last_modified": "2026-05-16T01:56:58+00:00",
-      "etag": "\"72d288a83fba706ea6b550a24aa0f4f4\""
+      "latest_month": "2026-05",
+      "last_modified": "2026-06-16T02:01:50+00:00",
+      "etag": "\"087195e233bbfa95d2a1311aae5204b0\""
     }
   }
 }
